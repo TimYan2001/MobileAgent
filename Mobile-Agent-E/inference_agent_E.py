@@ -17,14 +17,12 @@ from MobileAgentE.agents import (
 from MobileAgentE.agents import add_response, add_response_two_image
 from MobileAgentE.agents import ATOMIC_ACTION_SIGNITURES
 
-from modelscope.pipelines import pipeline
-from modelscope.utils.constant import Tasks
-from modelscope import snapshot_download, AutoModelForCausalLM, AutoTokenizer, GenerationConfig
-
 from dashscope import MultiModalConversation
 import dashscope
-import concurrent
+import concurrent.futures
+import ast
 import json
+import re
 from dataclasses import dataclass, field, asdict
 
 import os
@@ -39,7 +37,10 @@ BACKBONE_TYPE = os.environ.get("BACKBONE_TYPE", default="OpenAI") # "OpenAI" or 
 assert BACKBONE_TYPE in ["OpenAI", "Gemini", "Claude"], "Unknown BACKBONE_TYPE"
 print("### Using BACKBONE_TYPE:", BACKBONE_TYPE)
 
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_API_URL = os.environ.get(
+    "OPENAI_API_URL",
+    default="https://api.openai.com/v1/chat/completions",
+)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", default=None)
 
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions" # OpenAI compatible
@@ -49,8 +50,11 @@ CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", default=None)
 
 if BACKBONE_TYPE == "OpenAI":
-    REASONING_MODEL = "gpt-4o-2024-11-20"
-    KNOWLEDGE_REFLECTION_MODEL = "gpt-4o-2024-11-20"
+    REASONING_MODEL = os.environ.get(
+        "OPENAI_MODEL_NAME",
+        default="gpt-4o-2024-11-20",
+    )
+    KNOWLEDGE_REFLECTION_MODEL = REASONING_MODEL
 elif BACKBONE_TYPE == "Gemini":
     REASONING_MODEL = "gemini-1.5-pro-latest"
     KNOWLEDGE_REFLECTION_MODEL = "gemini-1.5-pro-latest"
@@ -62,6 +66,15 @@ elif BACKBONE_TYPE == "Claude":
 USAGE_TRACKING_JSONL = None # e.g., usage_tracking.jsonl
 
 ## Perceptor configs
+# "api" uses one multimodal API request for OCR, icon understanding, and
+# coordinate grounding. "local" keeps the original ModelScope pipelines.
+PERCEPTION_BACKEND = os.environ.get("PERCEPTION_BACKEND", default="api")
+PERCEPTION_MODEL = os.environ.get("PERCEPTION_MODEL", default="qwen3-vl-flash")
+PERCEPTION_OCR_MODEL = os.environ.get(
+    "PERCEPTION_OCR_MODEL", default="qwen-vl-ocr"
+)
+assert PERCEPTION_BACKEND in ["api", "local"], "Unknown PERCEPTION_BACKEND"
+
 # Choose between "api" and "local". api: use the qwen api. local: use the local qwen checkpoint
 CAPTION_CALL_METHOD = "api"
 # Choose between "qwen-vl-plus" and "qwen-vl-max" if use api method. Choose between "qwen-vl-chat" and "qwen-vl-chat-int4" if use local method.
@@ -226,7 +239,230 @@ def merge_text_blocks(
 
 ###################################################################################################
 
+def _extract_json_array(response_text):
+    """Parse a JSON array even when the model wraps it in a Markdown fence."""
+    response_text = response_text.strip()
+    if response_text.startswith("```"):
+        response_text = re.sub(r"^```(?:json)?\s*", "", response_text)
+        response_text = re.sub(r"\s*```$", "", response_text)
+
+    try:
+        parsed = json.loads(response_text)
+    except json.JSONDecodeError:
+        start = response_text.find("[")
+        end = response_text.rfind("]")
+        if start < 0 or end <= start:
+            raise ValueError(
+                "API perception did not return a JSON array: "
+                + response_text[:500]
+            )
+        candidate = response_text[start:end + 1]
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            # Smaller visual models occasionally emit Python-style quoted
+            # dictionaries despite being asked for JSON. literal_eval keeps
+            # this fallback data-only and does not execute model output.
+            try:
+                parsed = ast.literal_eval(candidate)
+            except (SyntaxError, ValueError) as exc:
+                raise ValueError(
+                    "API perception returned invalid structured data: "
+                    + response_text[:1000]
+                ) from exc
+
+    if isinstance(parsed, dict):
+        parsed = parsed.get("elements")
+    if not isinstance(parsed, list):
+        raise ValueError("API perception response must be a JSON array.")
+    return parsed
+
+
+def _parse_perception_lines(response_text):
+    """Parse the compact line protocol used by the fast visual model."""
+    response_text = response_text.replace("```text", "").replace("```", "")
+    elements = []
+    for raw_line in response_text.splitlines():
+        line = raw_line.strip().lstrip("-*0123456789. ")
+        parts = [part.strip() for part in line.split("|", 3)]
+        if len(parts) != 4:
+            continue
+        element_type, raw_x, raw_y, content = parts
+        element_type = element_type.lower()
+        if element_type not in {"text", "icon"} or not content:
+            continue
+        try:
+            point = [float(raw_x), float(raw_y)]
+        except ValueError:
+            continue
+        elements.append({
+            "type": element_type,
+            "content": content,
+            "point": point,
+        })
+    if not elements:
+        raise ValueError(
+            "API perception returned no valid TYPE|X|Y|CONTENT lines: "
+            + response_text[:1000]
+        )
+    return elements
+
+
+def _parse_icon_lines(response_text):
+    """Parse normalized X1,Y1,X2,Y2,FUNCTION icon boxes."""
+    response_text = response_text.replace("```text", "").replace("```", "")
+    icons = []
+    seen = set()
+    ignored = {"notification", "wifi", "battery", "charge", "signal"}
+    for raw_line in response_text.splitlines():
+        parts = [
+            part.strip()
+            for part in re.split(r"[,|]", raw_line.strip().lstrip("-* "))
+        ]
+        if len(parts) != 5:
+            continue
+        try:
+            x1, y1, x2, y2 = map(float, parts[:4])
+        except ValueError:
+            continue
+        function = parts[4].strip().lower()
+        if not function or function in ignored:
+            continue
+        center_x = (x1 + x2) / 2.0
+        center_y = (y1 + y2) / 2.0
+        dedupe_key = (function, round(center_x / 20), round(center_y / 20))
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        icons.append({
+            "type": "icon",
+            "content": function,
+            "point": [center_x, center_y],
+        })
+        if len(icons) >= 20:
+            break
+    if not icons:
+        raise ValueError(
+            "API icon perception returned no valid X1,Y1,X2,Y2,FUNCTION lines: "
+            + response_text[:1000]
+        )
+    return icons
+
+
+def _get_text_perception_from_api(image_uri, model=PERCEPTION_OCR_MODEL):
+    """Use the dedicated OCR API, which returns original-pixel polygons."""
+    response = MultiModalConversation.call(
+        api_key=QWEN_API_KEY,
+        model=model,
+        messages=[{"role": "user", "content": [{"image": image_uri}]}],
+        ocr_options={"task": "advanced_recognition"},
+    )
+    try:
+        content = response["output"]["choices"][0]["message"]["content"][0]
+        words = content["ocr_result"]["words_info"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"API OCR perception failed: {response}") from exc
+
+    perception_infos = []
+    for word in words:
+        text = str(word.get("text", "")).strip()
+        location = word.get("location")
+        if not text or not isinstance(location, list) or len(location) < 8:
+            continue
+        xs = location[0::2]
+        ys = location[1::2]
+        perception_infos.append({
+            "text": "text: " + text,
+            "coordinates": [
+                int(round(sum(xs) / len(xs))),
+                int(round(sum(ys) / len(ys))),
+            ],
+        })
+    return perception_infos
+
+
+def _get_icon_perception_from_api(image_uri, width, height, model):
+    """Use a lightweight visual model only for non-text controls."""
+    prompt = f"""
+Analyze this Android phone screenshot and locate meaningful NON-TEXT icons or
+controls a user may click. Do not return text labels, status-bar decorations,
+product photos, or decorative graphics. Return at most 20 icons.
+
+Return plain text with exactly one icon per line and no header, Markdown,
+JSON, numbering, or explanation:
+X1,Y1,X2,Y2,FUNCTION
+
+X1,Y1,X2,Y2 are the icon bounding box in a normalized 0-to-1000 coordinate
+system. The original screenshot is {width}x{height} pixels. FUNCTION is a
+brief likely purpose such as search, back, close, menu, camera, cart, profile,
+or home.
+""".strip()
+    response = MultiModalConversation.call(
+        api_key=QWEN_API_KEY,
+        model=model,
+        messages=[{
+            "role": "user",
+            "content": [{"image": image_uri}, {"text": prompt}],
+        }],
+        enable_thinking=False,
+    )
+    try:
+        response_text = response["output"]["choices"][0]["message"]["content"][0]["text"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"API icon perception failed: {response}") from exc
+
+    elements = _parse_icon_lines(response_text)
+    perception_infos = []
+    for element in elements:
+        norm_x, norm_y = element["point"]
+        perception_infos.append({
+            "text": "icon: " + element["content"],
+            "coordinates": [
+                int(round(max(0, min(1000, norm_x)) * width / 1000.0)),
+                int(round(max(0, min(1000, norm_y)) * height / 1000.0)),
+            ],
+        })
+    return perception_infos
+
+
+def get_perception_infos_from_api(
+    image_path,
+    width,
+    height,
+    model=PERCEPTION_MODEL,
+    ocr_model=PERCEPTION_OCR_MODEL,
+):
+    """Replace local OCR/GroundingDINO with two concurrent API requests."""
+    if not QWEN_API_KEY:
+        raise ValueError("QWEN_API_KEY is required for API perception.")
+
+    image_uri = "file://" + os.path.abspath(image_path)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        text_future = executor.submit(
+            _get_text_perception_from_api, image_uri, ocr_model
+        )
+        icon_future = executor.submit(
+            _get_icon_perception_from_api, image_uri, width, height, model
+        )
+        text_infos = text_future.result()
+        try:
+            icon_infos = icon_future.result()
+        except Exception as exc:
+            # Text with accurate coordinates is sufficient for most actions;
+            # retain it if the optional icon call has a transient failure.
+            print("WARNING: API icon perception failed:", exc)
+            icon_infos = []
+
+    perception_infos = text_infos + icon_infos
+    if not perception_infos:
+        raise ValueError("API perception returned no usable screen elements.")
+    return perception_infos
+
+
 def load_perception_models(
+    perception_backend=PERCEPTION_BACKEND,
+    perception_model=PERCEPTION_MODEL,
+    perception_ocr_model=PERCEPTION_OCR_MODEL,
     device="cuda",
     caption_call_method=CAPTION_CALL_METHOD,
     caption_model=CAPTION_MODEL,
@@ -235,6 +471,20 @@ def load_perception_models(
     ocr_detection_model="iic/cv_resnet18_ocr-detection-db-line-level_damo",
     ocr_recognition_model="iic/cv_convnextTiny_ocr-recognition-document_damo",
     ):
+    if perception_backend == "api":
+        print("INFO: Using API perception; local GroundingDINO/OCR models are disabled.")
+        print("\t- Icon model:", perception_model)
+        print("\t- OCR model:", perception_ocr_model)
+        return None, None, None, None, None
+
+    from modelscope.pipelines import pipeline
+    from modelscope.utils.constant import Tasks
+    from modelscope import (
+        snapshot_download,
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        GenerationConfig,
+    )
 
     ### Load caption model ###
     if caption_call_method == "local":
@@ -261,7 +511,11 @@ def load_perception_models(
 
     ### Load ocr and icon detection model ###
     groundingdino_dir = snapshot_download(groundingdino_model, revision=groundingdino_revision)
-    groundingdino_model = pipeline('grounding-dino-task', model=groundingdino_dir)
+    groundingdino_model = pipeline(
+        'grounding-dino-task',
+        model=groundingdino_dir,
+        trust_remote_code=True,
+    )
     ocr_detection = pipeline(Tasks.ocr_detection, model=ocr_detection_model) # dbnet (no tensorflow)
     ocr_recognition = pipeline(Tasks.ocr_recognition, model=ocr_recognition_model)
 
@@ -274,6 +528,9 @@ def load_perception_models(
 
 
 DEFAULT_PERCEPTION_ARGS = {
+    "perception_backend": PERCEPTION_BACKEND,
+    "perception_model": PERCEPTION_MODEL,
+    "perception_ocr_model": PERCEPTION_OCR_MODEL,
     "device": "cuda",
     "caption_call_method": CAPTION_CALL_METHOD,
     "caption_model": CAPTION_MODEL,
@@ -285,6 +542,15 @@ DEFAULT_PERCEPTION_ARGS = {
 
 class Perceptor:
     def __init__(self, adb_path, perception_args = DEFAULT_PERCEPTION_ARGS):
+        self.perception_backend = perception_args.get(
+            "perception_backend", PERCEPTION_BACKEND
+        )
+        self.perception_model = perception_args.get(
+            "perception_model", PERCEPTION_MODEL
+        )
+        self.perception_ocr_model = perception_args.get(
+            "perception_ocr_model", PERCEPTION_OCR_MODEL
+        )
         self.ocr_detection, self.ocr_recognition, self.groundingdino_model, \
             self.vlm_model, self.vlm_tokenizer = load_perception_models(**perception_args)
         self.adb_path = adb_path
@@ -293,6 +559,16 @@ class Perceptor:
         get_screenshot(self.adb_path)
         
         width, height = Image.open(screenshot_file).size
+
+        if self.perception_backend == "api":
+            perception_infos = get_perception_infos_from_api(
+                screenshot_file,
+                width,
+                height,
+                model=self.perception_model,
+                ocr_model=self.perception_ocr_model,
+            )
+            return perception_infos, width, height
         
         text, coordinates = ocr(screenshot_file, self.ocr_detection, self.ocr_recognition)
         text, coordinates = merge_text_blocks(text, coordinates)

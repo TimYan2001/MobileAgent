@@ -461,12 +461,22 @@ class Operator(BaseAgent):
             ocr_detection = kwargs["ocr_detection"]
             ocr_recognition = kwargs["ocr_recognition"]
             app_name = arguments["app_name"].strip()
-            text, coordinate = ocr(screenshot_file, ocr_detection, ocr_recognition)
-            for ti in range(len(text)):
-                if app_name == text[ti]:
-                    name_coordinate = [int((coordinate[ti][0] + coordinate[ti][2])/2), int((coordinate[ti][1] + coordinate[ti][3])/2)]
-                    tap(adb_path, name_coordinate[0], name_coordinate[1]- int(coordinate[ti][3] - coordinate[ti][1]))# 
-                    break
+            if ocr_detection is None or ocr_recognition is None:
+                # API perception already provides center points, so avoid
+                # loading the original local OCR models just for Open_App.
+                for item in kwargs["info_pool"].perception_infos_pre:
+                    visible_text = item.get("text", "")
+                    if visible_text.startswith("text:") and app_name in visible_text:
+                        x, y = item["coordinates"]
+                        tap(adb_path, x, y)
+                        break
+            else:
+                text, coordinate = ocr(screenshot_file, ocr_detection, ocr_recognition)
+                for ti in range(len(text)):
+                    if app_name == text[ti]:
+                        name_coordinate = [int((coordinate[ti][0] + coordinate[ti][2])/2), int((coordinate[ti][1] + coordinate[ti][3])/2)]
+                        tap(adb_path, name_coordinate[0], name_coordinate[1]- int(coordinate[ti][3] - coordinate[ti][1]))# 
+                        break
             if app_name in ['Fandango', 'Walmart', 'Best Buy']:
                 # additional wait time for app loading
                 time.sleep(10)
