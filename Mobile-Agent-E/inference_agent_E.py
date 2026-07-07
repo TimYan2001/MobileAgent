@@ -89,6 +89,8 @@ INIT_TIPS = """0. Do not add any payment information. If you are asked to sign i
 1. By default, no APPs are opened in the background.
 2. Screenshots may show partial text in text boxes from your previous input; this does not count as an error.
 3. When creating new Notes, you do not need to enter a title unless the user specifically requests it.
+4. In search tasks, gray placeholder text, recommended queries, and historical suggestions shown inside or near a search box do not count as user-entered text. Prefer tapping the search box and typing the target query directly; only clear existing content after the box is focused and the text is clearly an actual editable value.
+5. In e-commerce add-to-cart tasks, once you have tapped "Add to Cart" or the final confirmation button for the selected item, treat a subsequent login, verification, captcha, or security-check page as a valid terminal state. Do not try to solve the verification; stop and report that the task is complete up to the verification barrier.
 """
 
 ## other

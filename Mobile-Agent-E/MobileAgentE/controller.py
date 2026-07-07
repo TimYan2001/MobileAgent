@@ -4,16 +4,71 @@ import subprocess
 from PIL import Image
 from time import sleep
 
+def _is_valid_image_file(path):
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) <= 0:
+            return False
+        with Image.open(path) as image:
+            image.verify()
+        return True
+    except Exception:
+        return False
+
+def _capture_screenshot_png(adb_path, local_file, retries=3):
+    if os.path.dirname(local_file) != "":
+        os.makedirs(os.path.dirname(local_file), exist_ok=True)
+
+    device_file = "/sdcard/screenshot.png"
+    last_error = ""
+    for attempt in range(1, retries + 1):
+        if os.path.exists(local_file):
+            try:
+                os.remove(local_file)
+            except OSError:
+                pass
+
+        subprocess.run(adb_path + f" shell rm {device_file}", capture_output=True, text=True, shell=True)
+        time.sleep(0.2)
+
+        result = subprocess.run(
+            adb_path + f" shell screencap -p {device_file}",
+            capture_output=True,
+            text=True,
+            shell=True,
+        )
+        if result.returncode != 0:
+            last_error = result.stderr.strip() or result.stdout.strip()
+            time.sleep(0.6)
+            continue
+
+        result = subprocess.run(
+            adb_path + f" pull {device_file} {local_file}",
+            capture_output=True,
+            text=True,
+            shell=True,
+        )
+        if result.returncode != 0:
+            last_error = result.stderr.strip() or result.stdout.strip()
+            time.sleep(0.6)
+            continue
+
+        if _is_valid_image_file(local_file):
+            subprocess.run(adb_path + f" shell rm {device_file}", capture_output=True, text=True, shell=True)
+            return local_file
+
+        try:
+            size = os.path.getsize(local_file)
+        except OSError:
+            size = -1
+        last_error = f"pulled invalid screenshot file (size={size})"
+        print(f"\tScreenshot capture attempt {attempt}/{retries} produced an invalid image; retrying...")
+        time.sleep(0.8)
+
+    raise RuntimeError(f"Error: Failed to capture a valid screenshot after {retries} attempts. {last_error}")
+
 def get_screenshot(adb_path):
-    command = adb_path + " shell rm /sdcard/screenshot.png"
-    subprocess.run(command, capture_output=True, text=True, shell=True)
-    time.sleep(0.5)
-    command = adb_path + " shell screencap -p /sdcard/screenshot.png"
-    subprocess.run(command, capture_output=True, text=True, shell=True)
-    time.sleep(0.5)
-    command = adb_path + " pull /sdcard/screenshot.png ./screenshot"
-    subprocess.run(command, capture_output=True, text=True, shell=True)
     image_path = "./screenshot/screenshot.png"
+    _capture_screenshot_png(adb_path, image_path, retries=4)
     save_path = "./screenshot/screenshot.jpg"
     image = Image.open(image_path)
     image.convert("RGB").save(save_path, "JPEG")
@@ -52,41 +107,10 @@ def save_screenshot_to_file(adb_path, file_path="screenshot.png"):
     Returns:
         str: The path to the saved screenshot, or raises an exception on failure.
     """
-    # Define the local filename for the screenshot
     local_file = file_path
-    
-    if os.path.dirname(local_file) != "":
-        os.makedirs(os.path.dirname(local_file), exist_ok=True)
 
-    # Define the temporary file path on the Android device
-    device_file = "/sdcard/screenshot.png"
-    
     try:
-        # print("\tRemoving existing screenshot from the Android device...")
-        command = adb_path + " shell rm /sdcard/screenshot.png"
-        subprocess.run(command, capture_output=True, text=True, shell=True)
-        time.sleep(0.5)
-
-        # Capture the screenshot on the device
-        # print("\tCapturing screenshot on the Android device...")
-        result = subprocess.run(f"{adb_path} shell screencap -p {device_file}", capture_output=True, text=True, shell=True)
-        time.sleep(0.5)
-        if result.returncode != 0:
-            raise RuntimeError(f"Error: Failed to capture screenshot on the device. {result.stderr}")
-        
-        # Pull the screenshot to the local computer
-        # print("\tTransferring screenshot to local computer...")
-        result = subprocess.run(f"{adb_path} pull {device_file} {local_file}", capture_output=True, text=True, shell=True)
-        time.sleep(0.5)
-        if result.returncode != 0:
-            raise RuntimeError(f"Error: Failed to transfer screenshot to local computer. {result.stderr}")
-        
-        # Remove the screenshot from the device
-        # print("\tRemoving screenshot from the Android device...")
-        result = subprocess.run(f"{adb_path} shell rm {device_file}", capture_output=True, text=True, shell=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Error: Failed to remove screenshot from the device. {result.stderr}")
-        
+        _capture_screenshot_png(adb_path, local_file, retries=4)
         print(f"\tAtomic Operation Screenshot saved to {local_file}")
         return local_file
     
